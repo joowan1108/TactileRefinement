@@ -103,7 +103,7 @@ $$
 
 The left-hand expression is the selected target. It is a **latent representation of future net tactile depth change**. The predictor supplies the future tactile condition for action refinement. We do not compute $\hat z_t-g_t$: these represent a future change and a current observation, respectively. The method uses predicted tactile conditioning, with no explicit prediction-error subtraction.
 
-Ground the predictor with
+In Stage 1, ground the predictor with
 
 $$
 \mathcal L_{\rm pred}=
@@ -141,10 +141,10 @@ It completes the trajectory from $\tau_s$ to zero for all 50 actions together. T
 
 The intended mapping is
 
-$
+$$
 (Y_t,\hat z_t,KV_{\rm prefix},q_t)
 \longrightarrow \hat A_t\approx A_t^{\rm demo}.
-$
+$$
 
 The expert may change any valid component of the full action chunk. The objective is demonstrated-action reconstruction conditioned on predicted future tactile information; no small-residual bound or joint-specific correction restriction is imposed.
 
@@ -164,7 +164,7 @@ v^*=\frac{Y_t-A_t^{\rm demo}}{\tau_s},
 \quad 0<\tau\le\tau_s.
 $$
 
-Train the expert with masked velocity regression:
+In Stages 2 and 3, train refinement with masked velocity regression:
 
 $$
 \mathcal L_{\rm refine}
@@ -175,24 +175,69 @@ The scaling by $\tau_s$ is required because the expert integrates in the origina
 
 This bridge is our explicit continuation objective. Replacing Gaussian noise with $Y_t$ while keeping the Gaussian-to-demonstration velocity target would be inconsistent. The proposal adopts cascaded refinement from FM-Steer; it does not include FM-Steer's value verifier or best-of-N selection.
 
-For initial deployment use six base Euler steps and four refinement steps, with step size $-0.1$. Each solver step updates the entire 50-action tensor. Cache $KV_{\rm prefix}$, $q_t$, and $\hat z_t$ for this refinement pass. Finish refining the complete chunk before execution, then execute its 50 actions in order, subject to the environment's success, failure, and termination conditions. Acquire new observations and predict/refine a new chunk after that chunk ends. There is no intermediate 10-action tactile correction or replanning loop. Multiple numerical denoising steps do not imply multiple physical feedback cycles.
+For initial deployment use six base Euler steps and four refinement steps, with step size $-0.1$. Each solver step updates the entire 50-action tensor. Cache $KV_{\rm prefix}$, $q_t$, and $\hat z_t$ for this refinement pass. Finish refining the complete chunk before execution, then execute its 50 actions in order, holding each target for two physics steps as specified in Section 5, subject to the environment's success, failure, and termination conditions. Acquire new observations and predict/refine a new chunk after that chunk ends. There is no intermediate 10-action tactile correction or replanning loop. Multiple numerical denoising steps do not imply multiple physical feedback cycles.
 
-## 5. Training sequence and data alignment
+## 5. Three-stage training and execution timing
 
-| Stage | Train | Freeze |
-|---|---|---|
-| Representation pretraining | Shared tactile depth encoder, token projector, reconstruction decoder | Baseline SmolVLA |
-| Predictor grounding | Predictor, prefix adapter, prediction reconstruction head | Baseline; tactile depth encoder and target projector |
-| Refinement alignment | Copied tactile expert and tactile conditioning adapters | Baseline; encoder/projector; grounded predictor |
-| Joint refinement tuning | Tactile expert, predictor, their adapters and reconstruction head; retain predictive losses | Baseline and shared encoder/projector |
+**Encoder preparation:** Before the three policy-training stages, pretrain the shared tactile depth encoder $E$, projector $P$, and decoder as described in Section 2. Freeze $E$ and $P$ for all three stages, including normalization statistics. This is representation preparation, separate from the three-stage predictor/expert recipe. When the target is written compactly as $E(D_{t+H}-D_t)$, that shorthand includes the frozen projection $P$; the explicit target in this document remains $P(E(D_{t+H}-D_t))$.
 
-Keep the base vision encoder, language backbone, and original action expert frozen during these new stages. This is separate from the completed/configured dense baseline finetuning. A GPU memory and throughput measurement is required before assigning a duration or microbatch size to the new training stages.
+| Stage | Objective | Train | Freeze |
+|---|---|---|---|
+| 1. Future-tactile grounding | $\mathcal L_{\rm pred}$ from Section 3 | Predictor, its prefix adapter, prediction reconstruction head | Baseline SmolVLA; shared encoder/projector |
+| 2. Tactile-conditioned action refinement | $\mathcal L_{\rm refine}$ from Section 4 | Copied tactile expert and predicted-latent conditioning adapters | Baseline; shared encoder/projector; grounded predictor, its prefix adapter, and reconstruction head |
+| 3. End-to-end joint refinement | $\mathcal L_{\rm refine}$ only | Predictor, its prefix adapter, tactile expert, and predicted-latent conditioning adapters | Baseline; shared encoder/projector; Stage 1 reconstruction head |
 
-A training example at $t$ uses current observations at $t$, action targets corresponding to the next 50 recorded states, and tactile target at $t+50$. Verify this mapping against the actual loader and timestamps. Fifty indexes mean 50 recorded transitions, not necessarily 50 simulator physics steps.
+### Stage 1: ground the future-change representation
 
-Future targets must stay inside the same episode and continuous recording segment. If $t+50$ is unavailable or crosses a recording discontinuity, mask the future losses; retain valid action training with its own horizon mask. Do not silently clamp the endpoint or cross episode boundaries. Invalid depth pixels are masked in both the current map and future-change target.
+Learn $\hat z_t=F_\phi(g_t,C_t)$ against the frozen target $z_t^*$. Use the latent regression, reconstruction, and contrastive objectives already defined in Section 3. Future frames are available only to the supervision branch. Preserve the Stage 1 checkpoint and reconstruction head for subsequent diagnostics.
 
-All episodes remain in the training corpus. Eligibility masks enforce valid supervision and do not create a held-out split. Overlapping action chunks are acceptable, but losses and contrastive sampling must account for correlated samples.
+### Stage 2: teach the expert to consume the prediction
+
+Freeze the predictor in evaluation mode and train the expert to refine the entire intermediate SmolVLA action chunk toward its demonstrated target, conditioned on $(KV_{\rm prefix},q_t,\hat z_t)$. Use predicted $\hat z_t$ during training, never the ground-truth $z_t^*$. There is no direct $g_t$ input to the expert.
+
+This removes the direct-current-tactile bypass. It does **not** mathematically force use of $\hat z_t$: the expert can still rely on the prefix, joint state, or SmolVLA action chunk. Preserve prefix conditioning as part of the chosen architecture and measure latent usage through removal/shuffling controls. Any claim that this stage teaches useful predictive-tactile conditioning depends on those results.
+
+### Stage 3: adapt the predictor for action refinement
+
+Unfreeze the predictor and optimize the action-refinement loss through the complete added pathway:
+
+$$
+\mathcal L_{\rm refine}
+\longrightarrow \text{tactile expert}
+\longrightarrow \hat z_t
+\longrightarrow F_\phi.
+$$
+
+In this stage, future-target regression, contrastive loss, and tactile reconstruction loss are **not** optimization terms. The previously grounded representation is allowed to adapt for action generation. Recompute $\hat z_t$ with gradients enabled; do not detach it or reuse Stage 2 cached predictor outputs. Frozen base-prefix features and encoder outputs may remain cached.
+
+“End-to-end” here refers to the predictor and tactile expert with their trainable adapters. The base vision encoder, language backbone, original action expert, and shared tactile encoder/projector remain frozen.
+
+Action-only optimization can preserve useful predictive features, add current-contact information, or drift away from the original future-change target. Treat $\hat z_t$ as an action-adapted latent initialized by future-tactile grounding after this stage. Its continued interpretation as a future-tactile forecast must be checked, rather than guaranteed by the loss. Compare prediction/reconstruction diagnostics before and after joint training using the fixed target encoder and the saved Stage 1 reconstruction head, alongside rollout performance.
+
+### Hold each action for two physics steps
+
+For the selected Isaac45 setup, one physics step is $1/120$ second and adjacent valid recorded frames are two physics steps apart. Use the same cadence for executing each predicted target:
+
+$$
+\Delta t_{\rm action}=2\Delta t_{\rm physics}
+=\frac{2}{120}\ {\rm s},\qquad
+H\Delta t_{\rm action}=\frac{50\times2}{120}
+\approx0.833\ {\rm s}.
+$$
+
+Apply one denormalized joint-position target and keep it unchanged while the simulator advances twice. This is a zero-order hold of a position target, not adding a joint displacement twice. Do not consume the next predicted action or recompute policy/tactile conditioning between the two physics steps. Count the pair as one policy action; check termination during execution so success or failure can end a chunk early.
+
+Implement the action repeat at the policy-execution boundary. Do not globally change simulation decimation in a way that also changes reset/pre-move behavior. Verify simulated elapsed time and executed-action counts: 50 targets should advance 100 physics steps if the episode does not terminate early.
+
+Refine all 50 targets before execution, hold each for two physics steps, execute the full chunk, then acquire new observations and repeat. The baseline used for the controlled comparison must use the same action hold and 50-target execution schedule. Results from a one-physics-step-per-action or 10-action-replanning baseline are different configurations and must be labelled separately.
+
+### Data alignment
+
+A training example at recorded index $t$ uses current observations at $t$, targets $q_{t+1},\ldots,q_{t+50}$, and tactile target $D_{t+50}-D_t$. Check the recorded step counters for every valid training segment. Two-step action holding aligns the nominal sampling horizon; recorded joint states remain target proxies, so matching cadence alone does not establish that replay reproduces demonstration dynamics.
+
+Future targets must stay inside the same episode and continuous recording segment. If $t+50$ is unavailable or crosses a recording discontinuity, mask the future losses in Stage 1; retain valid action training in Stages 2 and 3 with its own horizon mask. Do not silently clamp the endpoint or cross episode boundaries. Invalid depth pixels are masked in both the current map and future-change target.
+
+All 800 episodes remain in the training corpus, with no train/validation split. Eligibility masks enforce valid supervision. Overlapping action chunks are acceptable, but Stage 1 contrastive sampling must account for correlated samples. Measure GPU memory and throughput before assigning microbatch sizes or stage durations.
 
 ## 6. Strict assessment and required evidence
 
@@ -204,6 +249,7 @@ The main limitations are:
 - Endpoint subtraction loses intermediate events. Contact followed by release can give nearly zero change, as can a stable loaded grasp. The predictor observes the current state, but its endpoint-change target cannot encode the complete intervening contact trajectory.
 - Demonstrations teach continuation toward demonstrated actions. They provide limited coverage of failed grasps and recovery states; low offline loss does not establish robust correction.
 - All 50 refined actions execute before another tactile prediction. Unexpected contact changes within a chunk cannot trigger a new tactile refinement pass in this design.
+- Stage 2 does not guarantee that the expert uses its predicted tactile condition. Stage 3 can change the latent's predictive meaning because only the action objective remains.
 
 Evaluate on the same new simulator seeds, task settings, and full-chunk execution schedule. A baseline evaluated with 10-action replanning is a separate controller configuration; compare against a 50-action-execution baseline before attributing gains to tactile prediction:
 
@@ -218,6 +264,6 @@ The current-depth ablation is an experimental control only. The proposed deploye
 
 Also perturb or shuffle tactile inputs and predicted tokens to test whether the policy uses them. Report per-task success and confidence intervals, drops or failed grasps, and inference latency. Report normalized tactile depth reconstruction error separately for non-contact, contact onset, sustained contact, and unloading.
 
-Check prediction against a zero-change forecast and a constant training-target forecast. Use independent evaluation rollouts for generalization measurements; label any training-corpus retrieval results accordingly. Do not count nearby overlapping windows as independent evidence.
+Check prediction against a zero-change forecast and a constant training-target forecast. Repeat these diagnostics after Stage 3 to distinguish retained predictive grounding from improved action performance with a changed representation. Use independent evaluation rollouts for generalization measurements; label any training-corpus retrieval results accordingly. Do not count nearby overlapping windows as independent evidence.
 
-Implementation acceptance requires fixed dataset-wide normalization, preserved signed changes, non-collapsed representations, correct future/action alignment, no future-target leakage, initial copied-expert equivalence, and improved task performance over the current-depth conditioning control.
+Implementation acceptance requires fixed dataset-wide normalization, preserved signed changes, non-collapsed representations, correct future/action alignment and two-physics-step action holds, no future-target leakage, initial copied-expert equivalence, and improved task performance over the current-depth conditioning control.
