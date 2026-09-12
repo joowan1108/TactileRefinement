@@ -8,36 +8,36 @@ Final research design — September 12, 2026.
 
 Use the trained vision-language-proprioception SmolVLA as a frozen motion planner. Add a shared deformation encoder, a future-change predictor, and a separate tactile expert that completes partially denoised action chunks.
 
-The tactile input is a single current deformation map from each gripper finger, corrected using a verified unloaded reference. No tactile history is required. The baseline retains its original observation inputs and weights throughout refinement training.
+The tactile input is a single normalized current deformation map from each gripper finger. No episode-start frame is subtracted, and no tactile history is required. The baseline retains its original observation inputs and weights throughout refinement training.
 
 All 800 UniVTAC demonstration episodes remain available for training, with **no train/validation split**. Benchmark performance is measured through separate simulator rollouts with new evaluation seeds. Training-set reconstruction and action losses are diagnostics, not estimates of generalization.
 
-## 1. Deformation maps and reference frames
+## 1. Deformation maps and normalization
 
-For finger $k\in\{L,R\}$, let $H_t^k$ be the recorded sensor depth and $B_e^k$ the verified unloaded depth reference for episode $e$. Define
+For finger $k\in\{L,R\}$, let $H_t^k$ be the recorded UniVTAC sensor depth. Convert it to an unsigned normalized deformation map with one fixed dataset-wide sensor range:
 
 $$
-D_t^k=\sigma_k(H_t^k-B_e^k),\qquad
+D_t^k=\operatorname{clip}\!\left(\frac{H_{\rm far}-H_t^k}{H_{\rm far}-H_{\rm near}},0,1\right),
+\qquad H_{\rm near}=24.0\ \mathrm{mm},\quad H_{\rm far}=34.0\ \mathrm{mm}.
+$$
+
+Equivalently, $D_t^k=\operatorname{clip}((34-H_t^k)/10,0,1)$. The 24–34 mm limits come from the fixed GelSight Mini camera clipping range in [UniVTAC's tactile configuration](https://github.com/univtac/UniVTAC/blob/main/envs/sensors/tactile.py#L49-L60). Do not estimate any normalization parameter from a frame or episode. This convention maps the 34 mm no-contact plane to zero and maps increasing indentation toward one.
+
+This is the UniVTAC equivalent of T-Rex preprocessing: the [released T-Rex loader](https://github.com/ZhuoyangLiu2005/T-Rex/blob/f88e10c61da123c68bf0927cf4860bc97a0381f3/scripts/train.py#L273-L278) reads its already constructed 8-bit deformation images and divides them by 255. T-Rex does not subtract an episode-start tactile frame.
+
+In our downloaded Isaac45 data, use **tactile/left_gsmini/depth** and **tactile/right_gsmini/depth**. Their frames are $240\times320$ float arrays in millimetres. The [UniVTAC sensor implementation](https://github.com/univtac/UniVTAC/blob/main/third_party/TacEx/source/tacex/tacex/gelsight_sensor.py) converts its height map to millimetres, and the [robot configuration](https://github.com/univtac/UniVTAC/blob/main/envs/robot/robot_cfg.py#L61-L68) confirms the 34 mm far plane.
+
+Do **not** use the first frame as a zero-contact reference. An audit of all 800 downloaded episodes found that only the 200 `lift_bottle` and `lift_can` episodes start with both sensors exactly at 34 mm. The other 600 episodes start with contact on both sensors because task-specific `pre_move()` can grasp or insert the object before recording begins. The reset and recording order is visible in [UniVTAC's base task](https://github.com/univtac/UniVTAC/blob/main/envs/_base_task.py#L386-L430).
+
+Use a fixed sensor-valid region and mask invalid depth pixels. Apply the same crop, resize, $H_{\rm far}$, and $H_{\rm near}$ to every frame in training and inference. Do not normalize each frame independently; doing so would erase absolute deformation magnitude.
+
+Construct the future-change map after normalizing the two absolute maps:
+
+$$
 \Delta D_{t,50}^k=D_{t+50}^k-D_t^k.
 $$
 
-The calibration sign $\sigma_k\in\{-1,+1\}$ makes indentation positive. Verify it through a controlled contact test. Preserve signed values, especially in $\Delta D$: increasing and decreasing indentation must remain distinguishable.
-
-In our downloaded Isaac45 data, use the depth streams belonging to **left_gsmini** and **right_gsmini**. Their frames are $240\times320$ float arrays. These are camera depths in millimetres, rather than deformation values already referenced to an unloaded gel. The [UniVTAC sensor implementation](https://github.com/univtac/UniVTAC/blob/main/third_party/TacEx/source/tacex/tacex/gelsight_sensor.py) converts camera depth to millimetres.
-
-Save each reference with its sensor identity, source, calibration configuration, contact-free verification, and validity mask. Capture it before object contact and before any scripted pre-grasp. **Do not automatically use the first saved demonstration frame:** UniVTAC runs a pre-move phase while recording is suppressed, so recording can begin after contact. See the [task reset and recording logic](https://github.com/univtac/UniVTAC/blob/main/envs/_base_task.py).
-
-For existing episodes, obtain a reference from a verified unloaded frame or reproduce a validated unloaded calibration with the matching simulator sensor configuration. Record which method was used. Availability of valid references across the downloaded corpus remains an implementation prerequisite; this document does not establish that those references already exist.
-
-Use a fixed sensor-valid region and mask invalid or clipped depth pixels. Apply the same spatial transform and a fixed physical scale to current maps and change maps. Do not normalize each frame independently, take absolute differences, or convert the training maps to unsigned images: these operations can erase deformation magnitude or unloading direction. Store the normalization and calibration with the model.
-
-The reference cancels algebraically in the change target:
-
-$$
-\Delta D_{t,50}^k=\sigma_k(H_{t+50}^k-H_t^k).
-$$
-
-It remains essential for the predictor's current-contact input.
+Although $D_t^k\in[0,1]$, preserve $\Delta D_{t,50}^k\in[-1,1]$ as a signed float. Positive values mean increasing deformation and negative values mean release. Do not take the absolute value, clip negative changes, or convert change maps to unsigned images.
 
 ## 2. Shared T-Rex deformation encoder
 
@@ -164,7 +164,7 @@ Keep the base vision encoder, language backbone, and original action expert froz
 
 A training example at $t$ uses current observations at $t$, action targets corresponding to the next 50 recorded states, and tactile target at $t+50$. Verify this mapping against the actual loader and timestamps. Fifty indexes mean 50 recorded transitions, not necessarily 50 simulator physics steps.
 
-Future targets must stay inside the same episode and continuous recording segment. If $t+50$ is unavailable or crosses a recording discontinuity, mask the future losses; retain valid action training with its own horizon mask. Do not silently clamp the endpoint or cross episode boundaries. Missing or invalid unloaded references mask the affected current-contact input; they must never be labelled zero contact.
+Future targets must stay inside the same episode and continuous recording segment. If $t+50$ is unavailable or crosses a recording discontinuity, mask the future losses; retain valid action training with its own horizon mask. Do not silently clamp the endpoint or cross episode boundaries. Invalid depth pixels are masked in both the current map and future-change target.
 
 All episodes remain in the training corpus. Eligibility masks enforce valid supervision and do not create a held-out split. Overlapping action chunks are acceptable, but losses and contrastive sampling must account for correlated samples.
 
@@ -191,4 +191,4 @@ Also perturb or shuffle tactile inputs and predicted tokens to test whether the 
 
 Check prediction against a zero-change forecast and a constant training-target forecast. Use independent evaluation rollouts for generalization measurements; label any training-corpus retrieval results accordingly. Do not count nearby overlapping windows as independent evidence.
 
-Implementation acceptance requires verified references, preserved signed changes, non-collapsed representations, correct future/action alignment, no future-target leakage, initial copied-expert equivalence, and improved closed-loop behavior over the current-deformation-only control.
+Implementation acceptance requires fixed dataset-wide normalization, preserved signed changes, non-collapsed representations, correct future/action alignment, no future-target leakage, initial copied-expert equivalence, and improved closed-loop behavior over the current-deformation-only control.
