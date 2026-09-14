@@ -8,28 +8,28 @@ The hypothesis is that predicted future tactile change can condition a separate 
 
 ```mermaid
 flowchart TB
-    subgraph Inputs[Current observation at time t]
-        DEPTH[Left and right tactile depth<br/>2 × 240 × 320]
-        VL[Head and wrist RGB<br/>language and robot state]
+    subgraph Inputs["Current observation at time t"]
+        DEPTH["Left and right tactile depth<br/>2 × 240 × 320"]
+        VL["Head and wrist RGB<br/>language and robot state"]
     end
 
-    subgraph TactilePath[Future-tactile prediction]
-        NORM[Fixed depth normalization<br/>clip((34 - H) / 10, 0, 1)]
-        ENC[T-Rex DeformEncoder<br/>frozen]
-        GRID[Two 128 × 15 × 20 grids<br/>no 4 × 4 pooling]
-        PROJ[Shared projector<br/>128 to 256]
-        TOKENS[600 current tactile tokens]
-        PRED[Future-tactile predictor<br/>600 learned queries]
-        ZHAT[Predicted future-tactile tokens]
+    subgraph TactilePath["Future-tactile prediction"]
+        NORM["Fixed depth normalization<br/>clip((34 - H) / 10, 0, 1)"]
+        ENC["T-Rex DeformEncoder<br/>frozen"]
+        GRID["Two 128 × 15 × 20 grids<br/>no 4 × 4 pooling"]
+        PROJ["Shared projector<br/>128 to 256"]
+        TOKENS["600 current tactile tokens"]
+        PRED["Future-tactile predictor<br/>600 learned queries"]
+        ZHAT["Predicted future-tactile tokens"]
         DEPTH --> NORM --> ENC --> GRID --> PROJ --> TOKENS --> PRED --> ZHAT
     end
 
-    subgraph SmolVLAPath[Frozen tactile-free SmolVLA]
-        PREFIX[Vision-language prefix encoder]
-        CTX[Visual-language context]
-        KV[Prefix K/V and robot state]
-        BASE[Original action expert<br/>six Euler steps: 1.0 to 0.4]
-        FLOW[Intermediate 50-action flow state]
+    subgraph SmolVLAPath["Frozen tactile-free SmolVLA"]
+        PREFIX["Vision-language prefix encoder"]
+        CTX["Visual-language context"]
+        KV["Prefix K/V and robot state"]
+        BASE["Original action expert<br/>six Euler steps: 1.0 to 0.4"]
+        FLOW["Intermediate 50-action flow state"]
         VL --> PREFIX
         PREFIX --> CTX
         PREFIX --> KV
@@ -38,29 +38,30 @@ flowchart TB
 
     CTX --> PRED
 
-    subgraph Stage1[Stage 1 grounding supervision]
-        FUTURE[Future depth D at t + 50]
-        DELTA[Signed change<br/>D at t + 50 minus D at t]
-        TARGET[Same frozen encoder<br/>and same projector]
-        STOP[Detached future-tactile target]
-        NCE[Symmetric InfoNCE]
-        RECON[Trainable reconstruction head]
-        COARSE[Predicted signed change<br/>2 × 60 × 80]
-        L1[L1 reconstruction loss]
+    subgraph Stage1["Stage 1 grounding supervision"]
+        FUTURE["Future depth D at t + 50"]
+        DELTA["Signed change<br/>D at t + 50 minus D at t"]
+        TARGET["Same frozen encoder<br/>and same projector"]
+        STOP["Detached future-tactile target"]
+        NCE["Symmetric InfoNCE"]
+        RECON["Trainable reconstruction head"]
+        COARSE["Predicted signed change<br/>2 × 60 × 80"]
+        L1["L1 reconstruction loss"]
         FUTURE --> DELTA --> TARGET --> STOP --> NCE
         ZHAT --> NCE
         ZHAT --> RECON --> COARSE --> L1
-        DELTA -->|valid-pixel area mean| L1
+        DELTA --> L1
     end
-    NORM -. current normalized depth .-> DELTA
+    NORM -.-> DELTA
 
-    subgraph Refine[Stage 2, Stage 3, and inference]
-        EXPERT[Tactile expert<br/>initialized from trained SmolVLA]
-        CHUNK[Refined full 50-action chunk]
-        EXEC[Execute each target for<br/>two physics steps]
+    subgraph Refine["Stage 2, Stage 3, and inference"]
+        EXPERT["Tactile expert<br/>initialized from trained SmolVLA"]
+        CHUNK["Refined full 50-action chunk"]
+        EXEC["Execute each target for<br/>two physics steps"]
         FLOW --> EXPERT
         ZHAT --> EXPERT
-        KV -->|masked in Stage 2<br/>restored in Stage 3 and inference| EXPERT
+        MASK["Prefix route<br/>masked in Stage 2<br/>restored in Stage 3 and inference"]
+        KV --> MASK --> EXPERT
         EXPERT --> CHUNK --> EXEC
     end
 
