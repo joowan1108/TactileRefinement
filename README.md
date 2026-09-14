@@ -79,7 +79,7 @@ Blue components are frozen, green components contain parameters trained in at le
 
 Use both ordered gripper depth maps, `tactile/left_gsmini/depth` and `tactile/right_gsmini/depth`, at 240×320. Normalize each map as
 
-$$D_t=\operatorname{clip}((34-H_t)/10,0,1).$$
+$$D_t=\mathrm{clip}((34-H_t)/10,0,1).$$
 
 Depth is in millimetres. No episode-start frame is subtracted. Invalid pixels are masked. This is a normalized tactile depth representation, not a calibrated measurement of gel indentation or force.
 
@@ -95,7 +95,7 @@ $$g_t=P(E(D_t)),\qquad \hat z_t=F(g_t,C_t).$$
 
 The future-tactile target uses the **same encoder and the same projector**:
 
-$$z_t^*=\operatorname{stopgrad}\left[P(E(D_{t+50}-D_t))\right].$$
+$$z_t^*=\mathrm{stopgrad}\left[P(E(D_{t+50}-D_t))\right].$$
 
 Preserve the signed change, including negative values. Future frames are supervision only; they never enter the predictor's input. Endpoints crossing a recording discontinuity or episode boundary are masked, not clamped to the final frame. The current projector branch receives gradients; the target branch is detached. There is no separate target projector or EMA encoder.
 
