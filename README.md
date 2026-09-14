@@ -1,8 +1,8 @@
 # Tactile Refinement
 
-Current implementation: pretrained T-Rex full-grid tactile encoder with N₀-VTLA-style future-tactile grounding (September 13, 2026). See [IMPLEMENTATION.md](IMPLEMENTATION.md) for code, configuration and commands. Earlier experiment descriptions are preserved in `archive/`; they are not the active recipe.
+Current implementation: pretrained T-Rex full-grid tactile encoder, N₀-VTLA-style future-tactile grounding, and **rank-32 FFN LoRA on one shared SmolVLA action expert** (September 14, 2026). See [IMPLEMENTATION.md](IMPLEMENTATION.md) for code, configuration and commands. Earlier experiment descriptions are preserved in `archive/`; they are not the active recipe.
 
-The hypothesis is that predicted future tactile change can condition a separate action expert to refine a frozen, tactile-free SmolVLA's full action chunk. Training losses alone do not establish manipulation success; matched UniVTAC rollouts are required.
+The hypothesis is that predicted future tactile change can guide LoRA-adapted continuation of SmolVLA's full action chunk. The baseline and tactile continuation share the same frozen original action weights; there is no second SmolVLA or copied action expert in the active recipe. Training losses alone do not establish manipulation success; matched UniVTAC rollouts are required.
 
 ## Implementation diagram
 
@@ -11,6 +11,7 @@ flowchart TB
     subgraph Inputs["Current observation at time t"]
         DEPTH["Left and right tactile depth<br/>2 × 240 × 320"]
         VL["Head and wrist RGB<br/>language and robot state"]
+        STATE["Current robot state"]
     end
 
     subgraph TactilePath["Future-tactile prediction"]
@@ -27,19 +28,21 @@ flowchart TB
     subgraph SmolVLAPath["Frozen tactile-free SmolVLA"]
         PREFIX["Vision-language prefix encoder"]
         CTX["Visual-language context"]
-        KV["Prefix K/V and robot state"]
-        BASE["Original action expert<br/>six Euler steps: 1.0 to 0.4"]
+        KV["Prefix K/V<br/>includes contextualized state token"]
+        WEIGHTS["ONE original action expert<br/>shared frozen weights"]
+        BASE["Baseline forward route<br/>six Euler steps: 1.0 to 0.4<br/>LoRA and tactile adapters bypassed"]
         FLOW["Intermediate 50-action flow state"]
         VL --> PREFIX
         PREFIX --> CTX
         PREFIX --> KV
         KV --> BASE --> FLOW
+        WEIGHTS --> BASE
     end
 
     CTX --> PRED
 
     subgraph Stage1["Stage 1 grounding supervision"]
-        FUTURE["Future depth D at t + 50"]
+        FUTURE["Normalized future depth D at t + 50"]
         DELTA["Signed change<br/>D at t + 50 minus D at t"]
         TARGET["Same frozen encoder<br/>and same projector"]
         STOP["Detached future-tactile target"]
@@ -55,25 +58,44 @@ flowchart TB
     NORM -.-> DELTA
 
     subgraph Refine["Stage 2, Stage 3, and inference"]
-        EXPERT["Tactile expert<br/>initialized from trained SmolVLA"]
+        ADAPTERS["Trainable FFN LoRA<br/>gate, up and down projections<br/>rank 32, alpha 32"]
+        TACTILE["Trainable tactile cross-attention residuals"]
+        DIRECT["Frozen state projection<br/>plus trainable direct-state adapter"]
+        EXPERT["Tactile continuation forward<br/>SAME original action weights<br/>predict action velocity"]
+        SOLVE["Inference: four Euler steps<br/>0.4 to 0.0"]
         CHUNK["Refined full 50-action chunk"]
         EXEC["Execute each target for<br/>two physics steps"]
-        FLOW --> EXPERT
-        ZHAT --> EXPERT
+        FLOW --> SOLVE
+        SOLVE --> EXPERT
+        ZHAT --> TACTILE --> EXPERT
+        ADAPTERS --> EXPERT
+        STATE --> DIRECT --> EXPERT
+        WEIGHTS --> EXPERT
         MASK["Prefix route<br/>masked in Stage 2<br/>restored in Stage 3 and inference"]
         KV --> MASK --> EXPERT
-        EXPERT --> CHUNK --> EXEC
+        EXPERT --> SOLVE
+        SOLVE --> CHUNK --> EXEC
+    end
+
+    subgraph ActionTraining["Stage 2 and Stage 3 action supervision"]
+        DEMO["Demonstrated 50-action chunk"]
+        BRIDGE["Sample flow time in 0 to 0.4<br/>interpolate demo and detached handoff<br/>construct target velocity"]
+        ACTIONLOSS["Padding-masked velocity MSE<br/>nine physical action dimensions"]
+        FLOW --> BRIDGE
+        DEMO --> BRIDGE --> EXPERT
+        BRIDGE --> ACTIONLOSS
+        EXPERT --> ACTIONLOSS
     end
 
     classDef frozen fill:#e8eef7,stroke:#46658a,color:#172334;
     classDef trainable fill:#e5f6ea,stroke:#39814d,color:#17351f;
     classDef supervision fill:#fff1d6,stroke:#a66b00,color:#4b3100;
-    class ENC,PREFIX,BASE frozen;
-    class PROJ,PRED,RECON,EXPERT trainable;
-    class FUTURE,DELTA,STOP,NCE,L1 supervision;
+    class ENC,PREFIX,WEIGHTS,BASE frozen;
+    class PROJ,PRED,RECON,ADAPTERS,TACTILE,DIRECT trainable;
+    class FUTURE,DELTA,STOP,NCE,L1,DEMO,BRIDGE,ACTIONLOSS supervision;
 ```
 
-Blue components are frozen, green components contain parameters trained in at least one stage, and orange components exist only for Stage 1 supervision. The shared projector is trained through the current-depth branch in Stage 1; its future-target output is detached after the same projector has been applied. The reconstruction head is used only for grounding training.
+Blue components are frozen, green components contain parameters trained in at least one stage, and orange components provide training supervision. Both action routes reference the **same** original weights. Action training evaluates one sampled bridge state; inference integrates four continuation steps. The direct-state adapter remains available when Stage 2 masks all prefix K/V. The shared tactile projector is trained through the current-depth branch in Stage 1; its future-target output is detached. The reconstruction head is used only for grounding training.
 
 ## Tactile representation
 
@@ -109,24 +131,38 @@ Our reconstruction output is two 60×80 maps, supervised using valid-pixel area 
 
 ## Stage 2: tactile-conditioned action refinement
 
-Freeze the encoder, projector, predictor and reconstruction head. Train only the separate tactile expert, initialized as an independent copy of the trained SmolVLA action expert. New tactile cross-attention and direct-state residual output projections start at zero. No LoRA is used.
+Freeze the encoder, projector, predictor, reconstruction head and all original SmolVLA parameters, including vision/language, action attention, FFNs and state/action projections. Train **rank-32 FFN LoRA**, tactile cross-attention residuals and the direct-state adapter. The refinement route references the baseline's actual action modules; it does not copy them.
+
+Apply LoRA to `gate_proj`, `up_proj` and `down_proj` in all 16 action-expert layers (48 matrices), with rank 32, alpha 32, scaling alpha/rank = 1 and no dropout. Each projection becomes $W x + (\alpha/r) B A x$ only in the tactile continuation route. Initialize A with Kaiming uniform and B to zero; the tactile residual output projections and direct-state adapter also start at zero. This adds **4,251,648 FFN LoRA parameters**, plus the tactile-conditioning and state-adapter parameters. Original attention projections receive no LoRA. With prefix access enabled, the initial continuation reproduces baseline behavior; Stage 2 intentionally changes that behavior by masking the prefix.
+
+Stage 2 trains **27,499,728 parameters total**: 4,251,648 in FFN LoRA and 23,248,080 in tactile cross-attention/state adapters. LoRA changes how the existing FFNs process features; the cross-attention residuals are what introduce the predicted tactile tokens into those features.
 
 The frozen SmolVLA runs six Euler steps from flow time 1 to 0.4. Let its intermediate full 50-action chunk be $Y$. Sample $\tau\in(0,0.4]$ and use the demo-to-handoff bridge
 
 $$x_\tau=(1-\tau/0.4)A^{\mathrm{demo}}+(\tau/0.4)Y,\qquad v^*=(Y-A^{\mathrm{demo}})/0.4.$$
 
-Train the expert's velocity with action-padding-masked MSE on the nine physical action dimensions. The expert conditions on the predicted future tactile tokens and direct robot state. **Its prefix K/V access is masked in Stage 2**, including the contextualized state-token path. The predictor and baseline handoff retain their original visual-language context.
+Train the adapted velocity with action-padding-masked MSE on the nine physical action dimensions. Each layer retains the frozen original attention, applies its FFN with LoRA, then adds a trainable cross-attention residual over predicted future tactile tokens. A direct-state adapter adds projected robot state to the suffix embedding. **The continuation route's prefix K/V access is masked in Stage 2**, including the contextualized state-token path. The predictor and baseline handoff retain their original visual-language context. The six-step handoff is detached and always bypasses LoRA and all new tactile/state adapters.
 
 The expert receives neither current tactile tokens directly nor an explicit predicted-minus-current latent error. Removing the direct tactile shortcut does not guarantee that the expert uses the predictor; tactile ablations are still necessary.
 
 ## Stage 3: joint refinement and deployment
 
-Restore the tactile expert's prefix K/V access. Jointly train the projector, predictor and tactile expert using the action objective. Keep the pretrained T-Rex encoder, original SmolVLA and reconstruction head frozen. Future-tactile supervision is not used in this stage, so the learned latent may drift from its Stage 1 predictive interpretation; compare forecast diagnostics before and after joint training.
+Restore the continuation route's prefix K/V access. Jointly train the projector, predictor, FFN LoRA, tactile cross-attention residuals and direct-state adapter using the action objective. Keep the pretrained T-Rex encoder, all original SmolVLA weights and reconstruction head frozen. Future-tactile supervision is not used in this stage, so the learned latent may drift from its Stage 1 predictive interpretation; compare forecast diagnostics before and after joint training.
 
-At inference, observe current RGB, language, robot state and depth, predict the future tactile tokens, run the original action expert's six steps, then finish denoising with four tactile-expert steps at 0.4, 0.3, 0.2 and 0.1. Each step updates the whole 50-action chunk. Execute each joint-position target for two physical steps, then observe again after the complete chunk, unless the environment terminates. There is no intermediate 10-action correction loop and no reconstruction head at inference.
+At inference, observe current RGB, language, robot state and depth, predict the future tactile tokens, run the shared action expert for six steps with adapters bypassed, then finish denoising with four tactile-conditioned steps using FFN LoRA at 0.4, 0.3, 0.2 and 0.1. LoRA deltas remain unmerged so the baseline route stays unchanged. Each step updates the whole 50-action chunk. Execute each joint-position target for two physical steps, then observe again after the complete chunk, unless the environment terminates. There is no intermediate 10-action correction loop and no reconstruction head at inference.
+
+| Stage | Trainable parameters | Continuation prefix K/V |
+|---|---|---|
+| 1: grounding | Tactile projector, predictor, reconstruction head | Continuation unused |
+| 2: action refinement | FFN LoRA, tactile residuals, direct-state adapter | Fully masked |
+| 3: joint refinement | Stage 2 parameters plus tactile projector and predictor | Restored |
+
+The pretrained T-Rex encoder and every original SmolVLA parameter stay frozen in all three stages. Stage 2 supplies predicted tokens, not current tactile tokens, to the action route; withholding current tokens alone does not prove that the trained policy uses tactile information.
 
 ## Data, schedule and validation
 
 All 800 UniVTAC episodes remain available, with no training/validation split. Stage 1 masks examples without valid future supervision. Batch size is 16 with accumulation 4, effective batch 64, using bfloat16. Configured budgets are **100,000 grounding updates**, 20,000 expert updates and 10,000 joint updates. These are experiment budgets, not proven convergence thresholds. The current launch runs **grounding only and then exits**, saving checkpoints at 33,333, 66,666 and 100,000. An automatic continuation preserves the live run's first 10,000 updates and resumes through the new total; the earlier milestones are archived separately.
 
 The pretrained encoder was trained on another tactile domain, and signed difference maps differ from its nonnegative pretraining inputs. Transfer quality remains an empirical question. Measure future-change reconstruction against zero-change predictions, latent variation and retrieval, then evaluate matched policies in UniVTAC using identical action holds, replanning intervals and seeds. Existing baseline rollouts with another execution schedule are not a matched comparison.
+
+The live Stage 1 process continues its existing grounding objective and budget. Before Stage 2, loading its checkpoint transfers the learned tactile components and initializes the new LoRA/adapters. Migration is permitted only for encoder/grounding checkpoints with matching training settings and provenance; an already-trained dense expert cannot silently be discarded. New checkpoints store the added components without another copy of the original action weights. Legacy configurations remain loadable for historical diagnostics.
