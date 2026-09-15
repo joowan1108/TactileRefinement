@@ -80,9 +80,6 @@ flowchart TB
     end
 
     subgraph ActionTraining["Stage 2 and Stage 3 action supervision"]
-        RECGRID["Training-only spatial reconstruction<br/>position queries attend to compact tokens"]
-        FEATURETARGET["Detached 600-token prediction<br/>feature target; no future frames"]
-        COMPACTLOSS["Compact feature preservation<br/>Smooth L1 loss"]
         DEMO["Demonstrated 50-action chunk"]
         BRIDGE["Sample flow time in 0 to 0.4<br/>interpolate demo and detached handoff<br/>construct target velocity"]
         ACTIONLOSS["Padding-masked velocity MSE<br/>nine physical action dimensions"]
@@ -90,19 +87,17 @@ flowchart TB
         DEMO --> BRIDGE --> EXPERT
         BRIDGE --> ACTIONLOSS
         EXPERT --> ACTIONLOSS
-        COMPACT --> RECGRID --> COMPACTLOSS
-        ZHAT --> FEATURETARGET --> COMPACTLOSS
     end
 
     classDef frozen fill:#e8eef7,stroke:#46658a,color:#172334;
     classDef trainable fill:#e5f6ea,stroke:#39814d,color:#17351f;
     classDef supervision fill:#fff1d6,stroke:#a66b00,color:#4b3100;
     class ENC,PREFIX,WEIGHTS,BASE frozen;
-    class PROJ,PRED,RECON,RESAMPLE,RECGRID,ADAPTERS,TACTILE,DIRECT trainable;
-    class FUTURE,DELTA,STOP,NCE,L1,DEMO,BRIDGE,ACTIONLOSS,FEATURETARGET,COMPACTLOSS supervision;
+    class PROJ,PRED,RECON,RESAMPLE,ADAPTERS,TACTILE,DIRECT trainable;
+    class FUTURE,DELTA,STOP,NCE,L1,DEMO,BRIDGE,ACTIONLOSS supervision;
 ```
 
-Blue components are frozen, green components contain parameters trained in at least one stage, and orange components provide training supervision. Both action routes reference the **same** original weights. Action training evaluates one sampled bridge state; inference integrates four continuation steps. The direct-state adapter remains available when Stage 2 masks all prefix K/V. The shared tactile projector is trained through the current-depth branch in Stage 1; its future-target output is detached. The coarse depth-change head is used only for grounding; the separate compact-feature reconstruction head is used only in Stages 2 and 3. Neither reconstruction head runs at inference.
+Blue components are frozen, green components contain parameters trained in at least one stage, and orange components provide training supervision. Both action routes reference the **same** original weights. Action training evaluates one sampled bridge state; inference integrates four continuation steps. The direct-state adapter remains available when Stage 2 masks all prefix K/V. The shared tactile projector is trained through the current-depth branch in Stage 1; its future-target output is detached. The coarse depth-change reconstruction head is used only for Stage 1 grounding. Stages 2 and 3 train with the action objective alone; the resampler has no reconstruction head or spatial-difference loss.
 
 ## Tactile representation
 
@@ -144,41 +139,42 @@ $$\hat z_t\in\mathbb R^{600\times256},\qquad c_t=S(\hat z_t)\in\mathbb R^{32\tim
 
 Each finger retains its complete 15×20 predicted grid as attention memory. Add learned row, column and finger embeddings, then use 16 learned queries per finger and two transformer decoder blocks (width 256, eight heads, no dropout). The weights are shared across fingers, but attention is evaluated separately for each finger. Concatenate the 16 left and 16 right outputs in that order. This is learned attention compression, not fixed 4×4 averaging. The 16-token budget per finger is an initial experiment, not a proven optimum.
 
-To encourage spatial recoverability, a training-only head uses row/column/finger queries to reconstruct all 600 predicted feature vectors from **only the compact tokens**. It has no dense-feature skip connection. In Stages 2 and 3 add
+The resampler learns which predicted tactile information is useful through the action objective alone:
 
-$$\mathcal L_{\mathrm{compact}}=\mathrm{SmoothL1}\left(U(c_t),\mathrm{stopgrad}(\hat z_t)\right),\qquad
-\mathcal L_{2,3}=\mathcal L_{\mathrm{action}}+\lambda_{\mathrm{compact}}\mathcal L_{\mathrm{compact}},\quad\lambda_{\mathrm{compact}}=1.$$
+$$\mathcal L_{2,3}=\mathcal L_{\mathrm{action}}.$$
 
-This is feature preservation against the current prediction, not future-depth supervision. Action stages still read no future tactile frames. Stage 2 keeps the predictor/projector frozen; Stage 3 permits gradients through them on the compact-input branch, while the reconstruction target is detached. Consequently this auxiliary loss does not guarantee that Stage 3 retains true future-tactile semantics.
+There is no compression reconstruction head, compression loss, or spatial-difference loss. Stage 2 keeps the predictor/projector frozen; Stage 3 allows the action gradient to flow through the resampler into both. No compression gradient can change the predictor because no compression objective exists. The completed Stage 1 future-tactile grounding objective and checkpoint remain applicable.
 
-The resampler and its feature head are unused and frozen in Stage 1. Train both starting in Stage 2, reusing the existing grounding checkpoint without retraining T-Rex or restarting grounding. At inference compute the compact representation once per observation and reuse it across all four continuation steps. The expert's tactile attention has 50×32 query/key entries per head instead of 50×600; this reduces that matrix by 18.75×, not total model runtime by that factor. Compression is not guaranteed lossless: spatial reconstruction, small-contact sensitivity and matched rollout performance still need evaluation.
+The resampler is unused and frozen in Stage 1 and begins learning in Stage 2. The 16/16 allocation reserves equal token capacity for both fingers; it does not force the expert to give them equal attention or guarantee retention of all spatial detail. Tactile sensitivity and matched rollout performance require evaluation. Zero-initialized tactile residual output projections initially block the upstream action gradient; the first action update opens that path, and subsequent updates train the resampler.
+
+At inference compute the compact representation once per observation and reuse it across all four continuation steps. The expert's tactile attention has 50×32 query/key entries per head instead of 50×600; this reduces that matrix by 18.75×, not total model runtime by that factor. Existing grounding weights are reused without retraining T-Rex.
 
 ## Stage 2: tactile-conditioned action refinement
 
-Freeze the encoder, projector, predictor, Stage 1 reconstruction head and all original SmolVLA parameters, including vision/language, action attention, FFNs and state/action projections. Train **the resampler and compact-feature reconstruction head, rank-32 FFN LoRA**, tactile cross-attention residuals and the direct-state adapter. The refinement route references the baseline's actual action modules; it does not copy them.
+Freeze the encoder, projector, predictor, Stage 1 reconstruction head and all original SmolVLA parameters, including vision/language, action attention, FFNs and state/action projections. Train **the resampler, rank-32 FFN LoRA**, tactile cross-attention residuals and the direct-state adapter. The refinement route references the baseline's actual action modules; it does not copy them.
 
 Apply LoRA to `gate_proj`, `up_proj` and `down_proj` in all 16 action-expert layers (48 matrices), with rank 32, alpha 32, scaling alpha/rank = 1 and no dropout. Each projection becomes $W x + (\alpha/r) B A x$ only in the tactile continuation route. Initialize A with Kaiming uniform and B to zero; the tactile residual output projections and direct-state adapter also start at zero. This adds **4,251,648 FFN LoRA parameters**, plus the tactile-conditioning and state-adapter parameters. Original attention projections receive no LoRA. With prefix access enabled, the initial continuation reproduces baseline behavior; Stage 2 intentionally changes that behavior by masking the prefix.
 
-The action adapters contain 27,499,728 trainable parameters: 4,251,648 in FFN LoRA and 23,248,080 in tactile cross-attention/state adapters. The new resampler and its training-only feature head add 2,516,224 parameters, for **30,015,952 trainable parameters in Stage 2** and **32,633,296 in Stage 3**. LoRA changes how the existing FFNs process features; the cross-attention residuals introduce the **32 compact predicted tactile tokens** into those features.
+The action adapters contain 27,499,728 trainable parameters: 4,251,648 in FFN LoRA and 23,248,080 in tactile cross-attention/state adapters. The resampler adds 2,120,960 parameters, for **29,620,688 trainable parameters in Stage 2** and **32,238,032 in Stage 3**. LoRA changes how the existing FFNs process features; the cross-attention residuals introduce the **32 compact predicted tactile tokens** into those features.
 
 The frozen SmolVLA runs six Euler steps from flow time 1 to 0.4. Let its intermediate full 50-action chunk be $Y$. Sample $\tau\in(0,0.4]$ and use the demo-to-handoff bridge
 
 $$x_\tau=(1-\tau/0.4)A^{\mathrm{demo}}+(\tau/0.4)Y,\qquad v^*=(Y-A^{\mathrm{demo}})/0.4.$$
 
-Train the adapted velocity with action-padding-masked MSE on the nine physical action dimensions, plus the compact-feature preservation loss above. Each layer retains the frozen original attention, applies its FFN with LoRA, then adds a trainable cross-attention residual over 32 compact future tactile tokens. A direct-state adapter adds projected robot state to the suffix embedding. **The continuation route's prefix K/V access is masked in Stage 2**, including the contextualized state-token path. The predictor and baseline handoff retain their original visual-language context. The six-step handoff is detached and always bypasses LoRA and all new tactile/state adapters.
+Train the adapted velocity with action-padding-masked MSE on the nine physical action dimensions. Each layer retains the frozen original attention, applies its FFN with LoRA, then adds a trainable cross-attention residual over 32 compact future tactile tokens. A direct-state adapter adds projected robot state to the suffix embedding. **The continuation route's prefix K/V access is masked in Stage 2**, including the contextualized state-token path. The predictor and baseline handoff retain their original visual-language context. The six-step handoff is detached and always bypasses LoRA and all new tactile/state adapters.
 
 The expert receives neither current tactile tokens directly nor an explicit predicted-minus-current latent error. Removing the direct tactile shortcut does not guarantee that the expert uses the predictor; tactile ablations are still necessary.
 
 ## Stage 3: joint refinement and deployment
 
-Restore the continuation route's prefix K/V access. Jointly train the projector, predictor, resampler, compact-feature reconstruction head, FFN LoRA, tactile cross-attention residuals and direct-state adapter using the action and compact-feature preservation objectives. Keep the pretrained T-Rex encoder, all original SmolVLA weights and Stage 1 reconstruction head frozen. Future-tactile supervision is not used in this stage, so the learned latent may drift from its Stage 1 predictive interpretation; compare forecast diagnostics before and after joint training.
+Restore the continuation route's prefix K/V access. Jointly train the projector, predictor, resampler, FFN LoRA, tactile cross-attention residuals and direct-state adapter using the action objective alone. Keep the pretrained T-Rex encoder, all original SmolVLA weights and Stage 1 reconstruction head frozen. Future-tactile supervision is not used in this stage, so the learned latent may drift from its Stage 1 predictive interpretation; compare forecast diagnostics before and after joint training.
 
-At inference, observe current RGB, language, robot state and depth, predict 600 future tactile tokens and compress them to 32, run the shared action expert for six steps with adapters bypassed, then finish denoising with four tactile-conditioned steps using FFN LoRA at 0.4, 0.3, 0.2 and 0.1. LoRA deltas remain unmerged so the baseline route stays unchanged. Each step updates the whole 50-action chunk. Execute each joint-position target for two physical steps, then observe again after the complete chunk, unless the environment terminates. There is no intermediate 10-action correction loop and neither reconstruction head runs at inference.
+At inference, observe current RGB, language, robot state and depth, predict 600 future tactile tokens and compress them to 32, run the shared action expert for six steps with adapters bypassed, then finish denoising with four tactile-conditioned steps using FFN LoRA at 0.4, 0.3, 0.2 and 0.1. LoRA deltas remain unmerged so the baseline route stays unchanged. Each step updates the whole 50-action chunk. Execute each joint-position target for two physical steps, then observe again after the complete chunk, unless the environment terminates. There is no intermediate 10-action correction loop and no reconstruction head runs at inference.
 
 | Stage | Trainable parameters | Continuation prefix K/V |
 |---|---|---|
 | 1: grounding | Tactile projector, predictor, reconstruction head | Continuation unused |
-| 2: action refinement | Resampler, compact-feature head, FFN LoRA, tactile residuals, direct-state adapter | Fully masked |
+| 2: action refinement | Resampler, FFN LoRA, tactile residuals, direct-state adapter | Fully masked |
 | 3: joint refinement | Stage 2 parameters plus tactile projector and predictor | Restored |
 
 The pretrained T-Rex encoder and every original SmolVLA parameter stay frozen in all three stages. Stage 2 supplies predicted tokens, not current tactile tokens, to the action route; withholding current tokens alone does not prove that the trained policy uses tactile information.
@@ -189,4 +185,4 @@ All 800 UniVTAC episodes remain available, with no training/validation split. St
 
 The pretrained encoder was trained on another tactile domain, and signed difference maps differ from its nonnegative pretraining inputs. Transfer quality remains an empirical question. Measure future-change reconstruction against zero-change predictions, latent variation and retrieval, then evaluate matched policies in UniVTAC using identical action holds, replanning intervals and seeds. Existing baseline rollouts with another execution schedule are not a matched comparison.
 
-The live Stage 1 process continues its existing grounding objective and budget. Before Stage 2, loading its checkpoint transfers the learned tactile components and initializes the new LoRA/adapters, resampler and compact-feature head. Migration is permitted only for encoder/grounding checkpoints with matching training settings and provenance; an already-trained action-stage checkpoint cannot silently acquire random compression weights or discard its dense expert. New format-version-3 checkpoints store the resampler and added components without another copy of the original action weights. Legacy configurations without resampling remain loadable for historical diagnostics. Adding this module does not start Stage 2 automatically.
+Stage 1 completed 100,000 updates and paused on September 15, 2026. Before Stage 2, loading its checkpoint transfers the learned tactile components and initializes the new LoRA/adapters and resampler. Migration is permitted only for encoder/grounding checkpoints with matching training settings and provenance; an already-trained action-stage checkpoint cannot silently acquire random compression weights or discard its dense expert. New format-version-4 checkpoints store the action-supervised resampler without a compression reconstruction head. Earlier configurations using a nonzero compression reconstruction loss must explicitly migrate from grounding instead of silently changing their action-stage objective. Adding this module does not start Stage 2 automatically.
