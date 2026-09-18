@@ -1,152 +1,230 @@
-# UniVTAC simulation and evaluation settings
+# UniVTAC simulation setup specification
 
-Last verified: 2026-09-18. This document records the simulator and controller settings used for the SmolVLA baseline and tactile-refinement evaluations. The two evaluation schedules are intentionally different and must be reported separately.
+Last verified: 2026-09-18. This document specifies how to reproduce the UniVTAC simulation environment used by this project. It contains simulator setup only; it does not define a policy, training procedure, action schedule, checkpoint, or experiment.
 
-## Reproducibility boundary
+## Source and dependency versions
 
-- UniVTAC repository: [`univtac/UniVTAC`](https://github.com/univtac/UniVTAC)
-- Pinned UniVTAC commit: `0dafa10262e22f486f160a55d6f11aeab12d8e7b`
-- Simulator: Isaac Sim `4.5.0.0`
-- Isaac Lab: `0.41.3`
-- Simulator Python: `3.10.12`
-- Simulator PyTorch: `2.5.1+cu124`
-- cuRobo: `0.7.7`
-- Simulator NumPy: `1.26.4`
-- GPU used for the reported runs: NVIDIA GeForce RTX 3090
+| Component | Version |
+|---|---|
+| UniVTAC | commit `0dafa10262e22f486f160a55d6f11aeab12d8e7b` |
+| Isaac Sim | `4.5.0.0` |
+| Isaac Lab | `0.41.3` |
+| Python | `3.10.12` |
+| PyTorch | `2.5.1+cu124` |
+| NVIDIA cuRobo | `0.7.7` |
+| NumPy | `1.26.4` |
 
-The evaluator checks that the pinned UniVTAC schedule files are unmodified before an official-schedule run. The simulator runs in a separate Python 3.10 process because the policy environment and Isaac Sim use different Python and NumPy versions. Communication uses a private Unix socket; no simulator service is exposed over TCP.
+Repository: [`univtac/UniVTAC`](https://github.com/univtac/UniVTAC)
 
-## Simulator configuration
+Use an NVIDIA CUDA GPU supported by Isaac Sim 4.5. The current machine uses an NVIDIA GeForce RTX 3090, but the simulation code does not depend on that exact model.
+
+## Required environment variables
+
+Accept the NVIDIA Omniverse EULA before launching Isaac Sim:
+
+```bash
+export OMNI_KIT_ACCEPT_EULA=YES
+export OMNI_KIT_ALLOW_ROOT=1
+```
+
+In this workspace, the simulator environment is prepared with:
+
+```bash
+bash scripts/setup_benchmark.sh
+```
+
+The setup script creates `.venv-benchmark`, exposes the installed simulator packages to it, and verifies the exact versions listed above.
+
+## Isaac application initialization
+
+Isaac Sim must be launched before importing UniVTAC task modules:
+
+```python
+from isaaclab.app import AppLauncher
+
+launcher = AppLauncher(
+    headless=True,
+    enable_cameras=True,
+    livestream=0,
+    device="cuda:0",
+)
+simulation_app = launcher.app
+```
+
+Use one environment on `cuda:0`. Headless mode still requires `enable_cameras=True` because UniVTAC observations include rendered RGB images.
+
+## Task configuration
+
+After starting the Isaac application, import the selected task module and override its evaluation settings:
+
+```python
+import importlib
+from pathlib import Path
+
+task_name = "insert_tube"
+module = importlib.import_module(f"envs.{task_name}")
+cfg = module.TaskCfg()
+
+cfg.scene.num_envs = 1
+cfg.sim.device = "cuda:0"
+cfg.sim.enable_scene_query_support = True
+cfg.decimation = 1
+cfg.tactile_sensor_type = "gsmini"
+cfg.random_texture = False
+
+# Disable UniVTAC's internal dataset/video writers.
+cfg.save_frequency = 0
+cfg.video_frequency = 0
+cfg.render_frequency = 0
+cfg.save_dir = Path("eval_result") / task_name
+
+# Minimal observation set for RGB, robot state, tactile depth, and reset checks.
+cfg.obs_data_type = {
+    "camera": ["rgb"],
+    "embodiment": ["joint"],
+    "tactile": ["depth"],
+    "actor": True,
+}
+
+task = module.Task(cfg, mode="eval")
+```
+
+`enable_scene_query_support=True` is required in headless mode. TacEx uses scene queries to find the finger-case colliders and attach both deformable gel pads. Without it, the simulator may start while the tactile sensors remain invalid.
+
+Setting a field in `obs_data_type` controls which arrays are returned. It does not disable the underlying physics. For example, the `tactile` entry may be omitted from returned observations while tactile contact simulation remains active.
+
+## Physics configuration
+
+The following values come from UniVTAC's base task configuration:
 
 | Setting | Value |
 |---|---|
-| Isaac application | Headless, cameras enabled, livestream disabled |
-| Device | `cuda:0` |
-| Parallel environments | 1 |
-| Physics timestep | `1/120 s` (120 Hz) |
+| Physics timestep | `1/120 s` |
+| Physics rate | 120 Hz |
 | Task decimation | 1 |
-| UIPC timestep | Same as physics timestep |
+| Render interval | 1 physics step |
+| PhysX continuous collision detection | Enabled |
+| Friction combine mode | Multiply |
+| Restitution combine mode | Multiply |
+| Restitution | 0 |
+| UIPC timestep | `1/120 s` |
 | UIPC ground height | `0.001 m` |
 | UIPC contact distance `d_hat` | `0.0005 m` |
 | UIPC friction | Enabled |
 | UIPC epsilon velocity | `0.1` |
-| PhysX continuous collision detection | Enabled |
-| Rigid-body friction combine mode | Multiply |
-| Rigid-body restitution combine mode | Multiply |
-| Restitution | 0 |
-| Random textures | Disabled |
-| Tactile sensor type | GelSight Mini (`gsmini`) |
-| Scene query support | Enabled, so the two deformable gel pads attach correctly in headless mode |
-| Reset time limit | 120 seconds |
 
-Internal UniVTAC saving and video recording are disabled during evaluation (`save_frequency = video_frequency = render_frequency = 0`). The external evaluator records frames from returned observations instead. Physics and tactile simulation remain enabled in every run, including the tactile-free baseline, because task success, early-stop logic, and contact dynamics depend on them.
+Do not change the timestep or decimation without revalidating contact stability, tactile deformation, controller timing, and task success predicates.
 
-## Cameras and observations
+## Camera configuration
 
-The simulator provides two RGB cameras:
+UniVTAC's base task provides two cameras:
 
-| Camera | Simulator resolution | Update period |
+| Camera | Resolution | Update period |
 |---|---:|---:|
 | Head | 480 × 270 | `1/120 s` |
 | Wrist | 480 × 270 | `1/120 s` |
 
-The policy receives the instruction string, head RGB, wrist RGB, and a nine-value joint state. The joint state contains seven arm joints and two finger positions. Actor state is retained inside the simulator for reset verification but is not a policy input.
+RGB observations are unsigned 8-bit arrays in HWC layout with three channels. Some tasks override camera placement while preserving the observation interface.
 
-For the **SmolVLA baseline**, tactile arrays are deliberately omitted from policy IPC. The two tactile sensors are still simulated and checked after reset and every step for finite gel-pad, marker-motion, and height-map state.
+The base head camera uses:
 
-For the **tactile-refinement policy**, the evaluator additionally sends ordered left/right depth maps with shape `2 × 240 × 320`, in millimetres. Their order is `left_gsmini`, then `right_gsmini`. The policy normalizes each valid pixel as
+- Position offset: `(0.554, 1.0, 0.150)`
+- Rotation: `(0, 0, 0.707, 0.707)` in OpenGL convention
+- Focal length: `1.94`
+- Focus distance: `1.0`
+- Horizontal aperture: `2.688`
+- Clipping range: `(0.01, 100.0)`
 
-$$
-D = \mathrm{clip}((34-H_{\mathrm{mm}})/10, 0, 1).
-$$
+The wrist camera uses the camera already defined on the robot asset.
 
-Invalid pixels become zero after masking. This value is treated as normalized tactile depth, not calibrated indentation or force.
+## Tactile configuration
+
+Use two GelSight Mini sensors, one on each gripper finger:
+
+```python
+cfg.tactile_sensor_type = "gsmini"
+```
+
+Each returned tactile depth map has shape `240 × 320`. UniVTAC also simulates marker motion, a height map, gel-pad nodal positions, and the attachment transform even when only depth is requested as an observation.
+
+After reset, validate both tactile sensors:
+
+1. Exactly two tactile sensors exist.
+2. Each gel pad has at least three attachment-point indices.
+3. The attachment transform is finite.
+4. Gel-pad nodal positions are finite and nonempty.
+5. Marker-motion output is finite and nonempty.
+6. Height-map output is finite and nonempty.
+
+This catches the common failure where a headless simulator starts successfully but a gel pad fails to attach to its case collider.
+
+## Reset procedure
+
+Reset with an explicit seed and one task instruction:
+
+```python
+task.reset(seed=episode_seed, instructions=[instruction])
+
+if not task.plan_success:
+    raise RuntimeError("UniVTAC pre-move planning failed")
+
+observation = task._get_observations()
+```
+
+UniVTAC uses its original reset and pre-move planner. The base reset time limit is 120 seconds. Treat pre-move failure or reset timeout as a simulator/reset failure, not as a policy failure.
+
+For reproducibility, record:
+
+- Task name
+- Reset seed
+- Language instruction
+- UniVTAC commit
+- Final task configuration
+- Initial robot joint state
+- Initial actor poses
+- Tactile attachment counts and finite-state checks
+
+Robot joints and actor poses can detect obvious reset mismatches, but they are not a complete checksum of hidden deformable or UIPC state.
+
+## Observation structure
+
+With the minimal configuration above, `task._get_observations()` contains:
+
+```text
+observation/head/rgb          uint8 [270, 480, 3]
+observation/wrist/rgb         uint8 [270, 480, 3]
+embodiment/joint              9 finite values
+tactile/<left sensor>/depth   [240, 320]
+tactile/<right sensor>/depth  [240, 320]
+actor                         task-specific actor state
+```
+
+The nine joint values contain seven arm joints and two finger joints. Preserve the left/right tactile ordering explicitly when converting the observation to another format.
 
 ## Action interface
 
-The policy predicts absolute joint-position chunks with shape `50 × 9`. The nine values are seven arm targets plus two finger targets. UniVTAC's evaluation API consumes an eight-value target: the evaluator passes the seven arm values and the first finger value, and UniVTAC broadcasts that shared gripper target to both fingers.
+UniVTAC's joint-position action API consumes eight values:
 
-Actions are denormalized by the policy postprocessor before entering the simulator. The reported evaluations use bfloat16 autocast for policy inference and float32 physical action arrays. No action EMA is enabled in the current official baseline or matched tactile runs.
+```text
+[arm_joint_0, ..., arm_joint_6, shared_gripper_position]
+```
 
-## Schedule A: official SmolVLA baseline
+Apply one action with:
 
-This schedule follows the released UniVTAC SmolVLA deployment logic.
+```python
+import torch
 
-1. Read a new observation at every 120 Hz physics step.
-2. Predict a new 50-action SmolVLA chunk at every step.
-3. Add the chunk to the temporal-aggregation buffer.
-4. Execute the weighted aggregate for the current timestep.
-5. Advance exactly one 120 Hz physics step.
+qpos = torch.as_tensor(action_8d, device=task.device)
+executed, success = task.take_action(qpos, action_type="qpos")
+```
 
-Temporal aggregation uses a capacity of 1,000 timesteps and `k = 0.01`. If predictions that began at indices $s$ cover the current index $t$, their current actions are combined in oldest-to-newest order using weights
+The shared gripper value is applied to both finger joints. `take_action` sets arm and gripper position targets with `force=True` by default and advances the simulator. Check the task's action counter, physics-step counter, success predicate, and early-stop predicate after stepping.
 
-$$
-w_i=\exp(-0.01i),\qquad i=0,1,\ldots,n-1.
-$$
+If an external policy emits nine values containing two finger targets, define the reduction explicitly. The current wrapper uses the first finger target as the shared gripper command; this is a wrapper convention rather than a requirement of Isaac Sim.
 
-The executed action is the weighted mean. The evaluator independently reconstructs every aggregated action from the saved chunks and checks it numerically.
+## Tasks and default action limits
 
-The controller is UniVTAC's native `task.take_action(qpos)` path with `force=True`. It sets arm and gripper position targets, directly updates the corresponding DOF positions through the robot PhysX view, and advances one physics step. Existing velocity targets are left untouched. There is no interpolation and no EMA. Videos are encoded at 120 fps.
-
-The baseline policy inputs are only RGB, language, and joints. This schedule has a known timing caveat: the demonstration data were recorded every two physics steps (60 Hz), while the official deployment schedule advances the 50-action chunk index at 120 Hz.
-
-Current baseline evaluation identity:
-
-- Eight tasks
-- 100 requested episodes per task
-- Per-task seeds `1000000` through `1000099`
-- First three episodes per task recorded as video
-- Resume is keyed by `(task, seed)` and never overwrites completed episodes
-
-## Schedule B: matched tactile-refinement evaluation
-
-This is the default schedule for the Stage 2 tactile ablations and attention visualizations. It matches the 60 Hz cadence of recorded UniVTAC demonstrations while retaining 120 Hz physics.
-
-1. Read current RGB, joints, and tactile depth at a 60 Hz policy decision.
-2. Predict a fresh 50-action chunk.
-3. Advance temporal aggregation once at 60 Hz and select one endpoint action.
-4. Execute that endpoint through two 120 Hz physics substeps.
-5. Read a new observation and repeat.
-
-The two-substep controller reconstructs a linear position path from the previous commanded endpoint to the new endpoint:
-
-$$
-q_{1/2}=\tfrac12(q_{\mathrm{previous}}+q_{\mathrm{target}}),
-\qquad q_1=q_{\mathrm{target}}.
-$$
-
-The first action starts from the observed post-reset robot position. Both substeps use explicit zero velocity targets and `force=True`. Arm and shared-gripper positions are interpolated. Success and early-stop predicates are checked after each substep, so an episode may advance only one of the two substeps on its final action. Each pair counts as one policy action. Videos are encoded at 60 fps.
-
-Stage 2 final-checkpoint attention runs use:
-
-- Schedule name: `matched60`
-- Controller name: `linear_position`
-- Policy rate: 60 Hz
-- Physics rate: 120 Hz
-- Two physics substeps per complete policy action
-- New visual-language, proprioceptive, and tactile observation every policy action
-- Temporal aggregation enabled at the 60 Hz policy index
-- No EMA
-- Seed `2000000` for the one-episode-per-task diagnostic
-
-The attention evaluation's one rollout per task is qualitative and must not be reported as a task success-rate estimate.
-
-## Other implemented schedules
-
-These modes exist for controlled experiments and should not be mixed into the primary baseline/refinement comparison.
-
-| Schedule | Replanning | Execution | Status |
-|---|---|---|---|
-| `official` | New 50-action chunk every action | One 120 Hz native action | Official baseline schedule |
-| `matched60` | New 50-action chunk every action | Midpoint and endpoint at 120 Hz | Default tactile diagnostic schedule |
-| `full50` | One prediction per full chunk | All 50 actions, two physics substeps each | Open-loop reference mode |
-| `tactile10_vl50` | New 50-action chunk every 10 actions; execute first 10 | Two substeps per action | Implemented inference experiment; not used in the reported runs |
-
-In `tactile10_vl50`, tactile and proprioception refresh every 10 actions, while RGB/language context refreshes every 50. It uses no temporal aggregation or EMA. Because training did not include stale visual context or variable prediction horizons, this mode requires separate labeling and validation.
-
-## Tasks and termination
-
-| Task | Policy-action limit |
+| Task module | Default action limit |
 |---|---:|
 | `grasp_classify` | 300 |
 | `pull_out_key` | 300 |
@@ -157,47 +235,53 @@ In `tactile10_vl50`, tactile and proprioception refresh every 10 actions, while 
 | `put_bottle_in_shelf` | 300 |
 | `insert_hole` | 300 |
 
-Each task uses UniVTAC's own reset, pre-move planner, success predicate, and early-stop predicate. A reset is accepted only when UniVTAC reports `plan_success`. Episodes end on task success, task-specific early stop, or the policy-action limit. The custom two-substep controller is used only after reset; reset and pre-move retain UniVTAC's original controller.
+Use each task module's own `check_success()` and `check_early_stop()` implementation. Do not replace these with video-based manual judgments when calculating benchmark success.
 
-## Reset, seeds, and validation
+## Process isolation
 
-- The simulator is reset with an explicit episode seed and the task instruction.
-- PyTorch policy noise is seeded with the same episode seed.
-- Temporal-aggregation and policy state are cleared at every reset.
-- The evaluator hashes rounded robot-joint and actor poses to detect reset mismatches. This is not a checksum of hidden deformable/UIPC state.
-- Both tactile sensors must exist and have at least three attachment points. All checked tactile tensors must be finite.
-- Completed rows record policy actions, model calls, physics-step counts, simulated time, success, early stop, and tactile health.
-- Resume validates task/seed uniqueness and the complete schedule metadata before continuing.
+The simulator should run in its Python 3.10 environment, separate from model or analysis code that may require a different Python, PyTorch, or NumPy version. This project launches one simulator worker subprocess per active task and exchanges arrays through a private Unix socket.
 
-## Installation and launch requirements
+When serializing arrays across environments, send explicit dtype, shape, and contiguous bytes. Do not depend on pickled NumPy module paths because NumPy 1.x and 2.x environments are not pickle-compatible in all cases.
 
-Accept the NVIDIA Omniverse EULA before starting Isaac Sim:
+Recommended worker lifecycle:
 
-```bash
-export OMNI_KIT_ACCEPT_EULA=YES
-export OMNI_KIT_ALLOW_ROOT=1
+1. Start Isaac Sim.
+2. Import and construct one task.
+3. Send a ready message only after task construction succeeds.
+4. Handle reset and step commands sequentially.
+5. Close the task.
+6. Close the Isaac application.
+7. Terminate or kill only that worker if graceful shutdown times out.
+
+## Minimal cleanup
+
+Always close both the task and Isaac application:
+
+```python
+try:
+    # reset/step loop
+    ...
+finally:
+    if task is not None:
+        task.close()
+    simulation_app.close()
 ```
 
-Prepare the simulator environment from the project root:
+Leaving an Isaac worker alive can retain several gigabytes of GPU memory and interfere with other simulator or training processes.
 
-```bash
-bash scripts/setup_benchmark.sh
-```
+## Implementation checklist
 
-The setup script verifies the exact simulator package versions listed above. Evaluation creates one simulator subprocess per active task and writes its logs under `logs/univtac_workers/`.
-
-## Reporting checklist
-
-When sharing a result, always state:
-
-1. UniVTAC commit and task.
-2. Checkpoint hash and training stage.
-3. Schedule (`official`, `matched60`, `full50`, or `tactile10_vl50`).
-4. Policy rate, physics rate, replanning interval, and physics substeps per action.
-5. Temporal-aggregation parameters.
-6. Controller position and velocity behavior.
-7. Whether tactile input and action EMA were enabled.
-8. Episode seeds, episode count, and video count.
-9. Any reset or simulator failures, reported separately from policy failures.
-
-The official 120 Hz baseline and matched 60 Hz tactile evaluation are useful for different questions. Their success rates are not a controlled head-to-head comparison unless both policies are rerun with the same schedule and controller.
+- [ ] Checkout the pinned UniVTAC commit.
+- [ ] Install and verify the pinned simulator dependencies.
+- [ ] Accept the Omniverse EULA.
+- [ ] Launch Isaac before importing task modules.
+- [ ] Use one environment on `cuda:0` with cameras enabled.
+- [ ] Set physics to 120 Hz with decimation 1.
+- [ ] Enable scene-query support.
+- [ ] Select `gsmini` and verify both gel-pad attachments.
+- [ ] Disable random textures for deterministic evaluation setup.
+- [ ] Request only the observation fields needed by the caller.
+- [ ] Reset with an explicit seed and reject failed pre-move plans.
+- [ ] Preserve the task's native success and early-stop logic.
+- [ ] Record the full task configuration and reset metadata.
+- [ ] Close the task and Isaac application on every exit path.
