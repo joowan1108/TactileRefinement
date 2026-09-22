@@ -46,7 +46,11 @@ def main():
                    OMNI_KIT_ACCEPT_EULA='YES', OMNI_KIT_ALLOW_ROOT='1',
                    TOKENIZERS_PARALLELISM='false', OMP_NUM_THREADS='4',
                    HF_HUB_DISABLE_PROGRESS_BARS='1')
-        for attempt in range(1, 6):
+        attempt = 0
+        consecutive_no_progress = 0
+        previous_completed = completed_count()
+        while True:
+            attempt += 1
             resume = ['--resume'] if (OUTPUT / 'metadata.json').exists() else []
             status('running', attempt=attempt, command=command + resume)
             child = subprocess.Popen(command + resume, cwd=ROOT, env=env)
@@ -58,10 +62,19 @@ def main():
                     raise RuntimeError('Evaluator exited successfully without all rollouts')
                 status('complete', attempt=attempt)
                 return
-            status('retry_pending', attempt=attempt, returncode=child.returncode)
+            current_completed = completed_count()
+            if current_completed > previous_completed:
+                consecutive_no_progress = 0
+            else:
+                consecutive_no_progress += 1
+            previous_completed = current_completed
+            status('retry_pending', attempt=attempt, returncode=child.returncode,
+                   consecutive_no_progress=consecutive_no_progress)
+            if consecutive_no_progress >= 5:
+                status('failed', attempts=attempt,
+                       reason='five consecutive evaluator failures without a completed rollout')
+                raise SystemExit(1)
             time.sleep(15)
-        status('failed', attempts=5)
-        raise SystemExit(1)
 
 
 if __name__ == '__main__':
