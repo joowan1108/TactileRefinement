@@ -124,6 +124,10 @@ def main():
             state['last_commit'] = receipt.commit_url
             write_json(STATE, state)
             status('publishing_live', completed_rollouts=len(rows), commit=receipt.commit_url)
+        else:
+            status('publishing_live', completed_rollouts=len(read_rows()),
+                   published_videos=len(state['published_videos']),
+                   commit=state['last_commit'], resumed=True)
         while True:
             rows = read_rows()
             if len(rows) > EXPECTED:
