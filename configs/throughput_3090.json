@@ -1,0 +1,14 @@
+{
+  "gpu": "NVIDIA GeForce RTX 3090",
+  "batch_size": 16,
+  "gradient_accumulation_steps": 4,
+  "effective_batch_size": 64,
+  "warmup_updates_discarded": 2,
+  "measured_updates": 3,
+  "median_seconds_per_optimizer_step": 2.4836548129096627,
+  "estimated_optimizer_steps_72h": 104362,
+  "estimated_frame_samples_72h": 6679168,
+  "peak_vram_allocated_gib": 19.286139011383057,
+  "peak_vram_reserved_gib": 19.328125,
+  "note": "Short throughput estimate; production termination/checkpoints use elapsed time. Setup and model loading excluded; checkpoint writing included."
+}

@@ -1,0 +1,12 @@
+{
+  "shared_site_packages": "/tactile/contrast/.venv-univtac/lib/python3.10/site-packages",
+  "shared_dependencies_source": "/tactile/contrast/vendor/UniVTAC",
+  "task_code": "/tactile/new/UniVTAC",
+  "task_code_commit": "0dafa10262e22f486f160a55d6f11aeab12d8e7b",
+  "notes": [
+    "Benchmark venv reuses the installed Isaac Sim 4.5 / Isaac Lab 2.1.1 / CUDA 12.4 stack via a .pth file; no changes to the source environment.",
+    "TacEx uses the existing compiled local UniVTAC fork, with its attachment validity guard and diagnostics.",
+    "Root envs task source is identical to the previously installed checkout.",
+    "Bridge adapted from /tactile/contrast/src/tactile_smolvla; preserves simulator tactile physics while sending only RGB, joint state and instruction."
+  ]
+}

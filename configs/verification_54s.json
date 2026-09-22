@@ -1,0 +1,48 @@
+{
+  "pretrained_model": "lerobot/smolvla_base",
+  "model_revision": "c83c3163b8ca9b7e67c509fffd9121e66cb96205",
+  "vlm_model": "HuggingFaceTB/SmolVLM2-500M-Video-Instruct",
+  "vlm_revision": "7b375e1b73b11138ff12fe22c8f2822d8fe03467",
+  "manifest": "data/training_manifest.json",
+  "output_dir": "runs/verification_54s",
+  "seed": 42,
+  "device": "cuda",
+  "batch_size": 8,
+  "gradient_accumulation_steps": 8,
+  "effective_batch_size": 64,
+  "duration_hours": 0.015,
+  "checkpoint_hours": [
+    0.005,
+    0.01,
+    0.015
+  ],
+  "checkpoint_names": [
+    "checkpoint_1.pt",
+    "checkpoint_2.pt",
+    "final.pt"
+  ],
+  "chunk_size": 50,
+  "n_action_steps": 10,
+  "image_size": 256,
+  "freeze_vision_encoder": true,
+  "train_expert_only": true,
+  "train_state_proj": true,
+  "precision": "bfloat16",
+  "learning_rate": 0.0001,
+  "minimum_learning_rate": 2.5e-06,
+  "warmup_fraction": 0.03333333333333333,
+  "weight_decay": 1e-10,
+  "adam_betas": [
+    0.9,
+    0.95
+  ],
+  "grad_clip_norm": 10.0,
+  "num_workers": 2,
+  "prefetch_factor": 1,
+  "log_every_steps": 5,
+  "loss": "action_flow_matching_only",
+  "tactile_inputs": false,
+  "tactile_auxiliary_loss": false,
+  "push_to_hub": false,
+  "training_protocol": "all_episodes_no_holdout"
+}

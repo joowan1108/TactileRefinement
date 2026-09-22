@@ -179,9 +179,41 @@ At inference, observe current RGB, language, robot state and depth, predict 600 
 
 The pretrained T-Rex encoder and every original SmolVLA parameter stay frozen in all three stages. Stage 2 supplies predicted tokens, not current tactile tokens, to the action route; withholding current tokens alone does not prove that the trained policy uses tactile information.
 
+### Testing whether Stage 2 uses tactile information
+
+Two checkpoint diagnostics now test this directly. `tactile_refinement.ablation`
+compares correct depth, same-task depth from another episode, and a zero compact
+condition on identical observations/noise/handoffs. It reports action sensitivity,
+demonstration error and Stage 2 flow error, with episode-clustered confidence
+intervals and comparisons across saved updates. The donor depth is encoded with
+the original observation's visual-language context; whole predicted latents are
+not swapped. These are training-corpus adaptation diagnostics, not generalization
+scores.
+
+`tactile_refinement.ablation_rollout` runs the selected conditions with the same
+execution schedule and reports task success, early stops, durations and reset
+matching. Its default `matched60` schedule replans and temporally aggregates once
+per recorded-data interval, then executes the aggregated endpoint using midpoint
+and endpoint commands over two 120 Hz physics substeps. `official` retains the
+upstream one-step 120 Hz probe and `full50` retains the open-loop whole-chunk mode.
+All modes retain the Stage 2 prefix mask.
+The opt-in `--schedule tactile10_vl50` experiment predicts a fresh 50-action
+chunk every 10 executed actions, executes only its first 10, and refreshes RGB/
+language context every 50 actions. Current tactile and proprioception refresh
+at every replan. Visual-language features and KV stay cached between context
+refreshes; the state token's features and KV are recomputed at every VLM layer
+using the current joints. Execution uses the same two-substep midpoint/endpoint
+controller, without temporal aggregation or EMA. This is an inference-only
+experiment with existing checkpoints; older visual context was not explicitly
+included in the training pairs. It does not change the default `matched60` run.
+Zero-only degradation or changed actions alone is insufficient to establish useful
+tactile dependence. The full commands and report definitions are in the workspace
+file `docs/stage2_tactile_ablation.md` and the checkpoint-testing section of
+[IMPLEMENTATION.md](IMPLEMENTATION.md).
+
 ## Data, schedule and validation
 
-All 800 UniVTAC episodes remain available, with no training/validation split. Stage 1 masks examples without valid future supervision. Batch size is 16 with accumulation 4, effective batch 64, using bfloat16. Configured budgets are **100,000 grounding updates**, 20,000 expert updates and 10,000 joint updates. These are experiment budgets, not proven convergence thresholds. The current launch runs **grounding only and then exits**, saving checkpoints at 33,333, 66,666 and 100,000. An automatic continuation preserves the live run's first 10,000 updates and resumes through the new total; the earlier milestones are archived separately.
+All 800 UniVTAC episodes remain available, with no training/validation split. Stage 1 masks examples without valid future supervision. Batch size is 16 with accumulation 4, effective batch 64, using bfloat16. Stage 1 completed **100,000 grounding updates**. The current background launch runs **Stage 2 only for 100,000 updates**, with checkpoints at 33,333, 66,666 and 100,000, then exits. Stage 3 retains a future budget of 10,000 updates but does not start automatically. These are experiment budgets, not proven convergence thresholds. The initial two-update Stage 2 launch is preserved in `expert_initial_2_updates_before_stage2_100k_20260915/`; the current run initializes from the completed grounding checkpoint.
 
 The pretrained encoder was trained on another tactile domain, and signed difference maps differ from its nonnegative pretraining inputs. Transfer quality remains an empirical question. Measure future-change reconstruction against zero-change predictions, latent variation and retrieval, then evaluate matched policies in UniVTAC using identical action holds, replanning intervals and seeds. Existing baseline rollouts with another execution schedule are not a matched comparison.
 

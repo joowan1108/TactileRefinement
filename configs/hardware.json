@@ -1,0 +1,10 @@
+{
+  "gpu": "NVIDIA GeForce RTX 3090",
+  "vram": "24576 MiB",
+  "driver": "580.173.02",
+  "training_cuda": "12.8",
+  "simulation_cuda": "12.4",
+  "physical_batch_size": 16,
+  "gradient_accumulation_steps": 4,
+  "effective_batch_size": 64
+}

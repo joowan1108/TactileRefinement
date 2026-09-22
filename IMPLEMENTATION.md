@@ -10,17 +10,41 @@ The active grounding recipe is `trex_fullgrid_n0_v1`, with `expert_implementatio
 4. `src/tactile_refinement/model.py`: `predicted_tokens` computes `F(P(E(D_t)), C_t)`. During grounding, `loss` applies the identical E/P modules to signed future change under `no_grad`. The predictor never reads the future endpoint. Encoder parameters and BatchNorm remain frozen in every stage.
 5. `src/tactile_refinement/losses.py`: `n0_grounding_loss` combines symmetric cosine InfoNCE on mean-pooled/L2-normalized tokens with plain L1 reconstruction. `CoarseChangeHead` maps predicted tokens to two signed 60×80 maps for Stage 1 supervision. In action stages, `SpatialTactileResampler` in `representation.py` attends separately to each 300-token finger grid, using 16 learned queries per finger, learned row/column/finger embeddings, two width-256/eight-head transformer decoder blocks and a final LayerNorm. The same weights serve both fingers, while each finger has 16 dedicated output slots. `model.loss` uses the action velocity MSE alone in Stages 2 and 3. The compression reconstruction head and loss have been removed; no spatial-difference loss is used. The predictor/projector are frozen in Stage 2 and receive action gradients in Stage 3. Equal token allocation guarantees capacity for each finger, not equal attention from the expert.
 6. `RefinementModel.handoff` obtains the full action flow state at time 0.4 using six calls to the frozen original `core.denoise_step`, with no adapters and no gradients. `CachedTactileExpert` references that same expert and the same action/time/state projections through non-registered aliases. The baseline alone owns these weights, so adapter training and serialization cannot unfreeze or duplicate them. Its custom layer loop evaluates frozen attention, FFN plus `LowRankDelta`, and a tactile cross-attention residual. `gate_proj`, `up_proj` and `down_proj` in all 16 layers receive rank-32/alpha-32 LoRA: 4,251,648 added FFN parameters, scaling 1, no dropout, Kaiming-uniform A and zero B. Tactile/state residual outputs also start at zero. The state adapter enters before the first expert layer. Stage 2 removes all prefix K/V; Stage 3 restores it. The direct raw-state path remains available in both stages.
-7. `predict_action_chunk` compresses the prediction once per observation, reuses the 32 compact tokens across four continuation steps, returns all 50 nine-dimensional actions, and skips the Stage 1 reconstruction head. The `zero` ablation zeros the actual compact condition after resampling; `shuffle` and `current` also pass through the resampler. `src/tactile_refinement/benchmark.py` denormalizes using baseline statistics and holds each target for two physical steps.
+7. `predict_action_chunk` compresses the prediction once per observation, reuses the 32 compact tokens across four continuation steps, returns all 50 nine-dimensional actions, and skips the Stage 1 reconstruction head. The `zero` ablation zeros the actual compact condition after resampling; `shuffle` and `current` also pass through the resampler. `src/tactile_refinement/benchmark.py` denormalizes using baseline statistics. New evaluations default to `linear_position`: raw model endpoints without EMA, midpoint then endpoint at physics cadence, and explicit zero velocity targets. The historical `linear` mode uses derived velocity targets and amplified observed roughness; the zero-velocity mode eliminated measured endpoint overshoot in the EMA probe. Removing EMA does not remove roughness already present in model endpoints. Existing resumed evaluations retain their recorded controller; older runs use the two-step position hold. Optional arm EMA precedes interpolation. This approximates intermediate motion without reconstructing the original demonstration planner trajectory.
 
 | Stage | Trainable | Frozen | Updates / learning rate |
 |---|---|---|---|
 | Grounding | Projector, predictor, coarse-change head | T-Rex, original SmolVLA, action adapters, resampler | 100,000 / 1e-4 |
-| Expert | Resampler, FFN LoRA, tactile residuals, direct-state adapter; prefix masked | T-Rex, projector, predictor, coarse-change head, all original SmolVLA weights | 20,000 / 5e-5 |
+| Expert | Resampler, FFN LoRA, tactile residuals, direct-state adapter; prefix masked | T-Rex, projector, predictor, coarse-change head, all original SmolVLA weights | 100,000 / 5e-5 |
 | Joint | Projector, predictor, resampler, FFN LoRA, tactile residuals, direct-state adapter; prefix restored | T-Rex, coarse-change head, all original SmolVLA weights | 10,000 / 1e-5 |
 
 The FT target shares the current branch's actual encoder/projector objects. It is detached, while the projector receives gradients through current tactile input. The reconstruction head learns from the **predicted** latent, not from a future-target shortcut. AdamW, bfloat16, batch 16 and accumulation 4 are configured. The NCE negative set is a microbatch, not the accumulation window.
 
-## Training commands
+## Stage 2 checkpoint testing
+
+The new offline entry point `src/tactile_refinement/ablation.py` accepts
+`--checkpoints PATH [PATH ...] --samples 256 --output DIR`. Launch it from the
+workspace with `PYTHONPATH=src .venv-train/bin/python -m tactile_refinement.ablation`.
+It runs correct/mismatched/disabled tactile interventions with identical prefix,
+noise, handoff and bridge timesteps, and compares normalized action/flow errors.
+Donor maps retain left/right ordering and exclude the recipient's episode.
+
+The rollout entry point is `tactile_refinement.ablation_rollout`, with
+`--checkpoint PATH --tasks insert_HDMI --episodes 20 --schedule official --output DIR`.
+It runs all three conditions, saves the first three videos per condition, supports
+`--resume`, and separates reset-matched contrasts from same-seed-only contrasts.
+`--schedule full50` selects the older whole-chunk/two-step hold schedule for all
+conditions. `--smoke-steps 1` is an integration check, excluded from success rates.
+See workspace `docs/stage2_tactile_ablation.md` for complete commands and limitations.
+
+`RefinementModel.continue_action_chunk` now applies the saved stage's prefix mask
+at inference, and the benchmark calls `set_stage` after checkpoint loading.
+Stage 2 retains masking; Stage 3 restores access. This changes inference only;
+the existing action-training loss and checkpoints are unchanged.
+
+## Training launch
+
+Current launch: Stage 2 only, detached from SSH, initialized from the completed 100,000-update grounding checkpoint. It runs 100,000 updates at learning rate 5e-5, batch 16 and accumulation 4, saving at 33,333, 66,666 and 100,000. It exits after Stage 2; Stage 3 is not automatic. The first two-update launch is archived at `runs/tactile_refinement_trex_fullgrid_n0/expert_initial_2_updates_before_stage2_100k_20260915/`. Extending the future Stage 2 budget is permitted when loading a grounding checkpoint, without changing its training settings or learned weights.
 
 From `/tactile/new`, launch Stage 1 detached from SSH:
 

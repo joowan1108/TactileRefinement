@@ -1,0 +1,31 @@
+{
+  "baseline_checkpoint": "runs/smolvla_full_dense_b16_ga4_72h/final.pt",
+  "manifest": "data/training_manifest.json",
+  "output_dir": "runs/tactile_refinement_trex_fullgrid_n0",
+  "training_recipe": "trex_fullgrid_n0_v1",
+  "tactile_encoder_checkpoint": "runs/diagnostics/encoder_pooling_probe/trex_deform_encoder.pt",
+  "tactile_encoder_repo": "miniFranka/T-Rex_midtrain_mecka23k_ucb100_vqvae_epoch6",
+  "tactile_encoder_revision": "62efb3bcb45a3df0e088c8909d759b582cfb98af",
+  "device": "cuda",
+  "seed": 42,
+  "latent_width": 256,
+  "resampler_tokens_per_finger": 16,
+  "expert_initialization": "trained_smolvla_baseline_v1",
+  "expert_implementation": "shared_ffn_lora_v1",
+  "lora_rank": 32,
+  "lora_alpha": 32,
+  "stage2_mask_prefix": true,
+  "batch_size": 16,
+  "gradient_accumulation_steps": 4,
+  "num_workers": 0,
+  "cpu_threads": 4,
+  "weight_decay": 0.0001,
+  "grad_clip_norm": 10.0,
+  "lambda_rec": 1.0,
+  "lambda_nce": 1.0,
+  "stages": {
+    "grounding": {"updates": 100000, "learning_rate": 0.0001},
+    "expert": {"updates": 100000, "learning_rate": 0.00005},
+    "joint": {"updates": 10000, "learning_rate": 0.00001}
+  }
+}
