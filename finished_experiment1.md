@@ -60,9 +60,7 @@ Let:
 
 At a functional level, the updated predictor is
 
-\[
-\hat z_t = F_\phi(E(T_t), C_t, q_t),
-\]
+$$\hat z_t = F_\phi(E(T_t), C_t, q_t)$$
 
 with supervision associated with the tactile observation at \(t+20\).
 The prediction is then supplied to the action expert through the added tactile
@@ -88,11 +86,7 @@ The method first trains a representation of future tactile information. In the
 repository's grounding formulation, predicted tokens are supervised using a
 contrastive objective and a reconstruction objective:
 
-\[
-\mathcal L_{\mathrm{ground}}
-= \mathcal L_{\mathrm{contrastive}}
-+ \lambda_{\mathrm{rec}}\mathcal L_{\mathrm{reconstruction}}.
-\]
+$$\mathcal L_{\mathrm{ground}} = \mathcal L_{\mathrm{contrastive}} + \lambda_{\mathrm{rec}}\mathcal L_{\mathrm{reconstruction}}$$
 
 The contrastive term associates each prediction with its corresponding future
 tactile target. The reconstruction term encourages the representation to retain
@@ -114,12 +108,7 @@ The inherited recipe freezes the grounded predictor during this stage and
 trains the action-conditioning modules using the demonstrated-action objective.
 For a flow-matching expert, this is schematically
 
-\[
-\mathcal L_{\mathrm{action}}
-= \mathbb E\!\left[
-\left\|v_\theta(x_\tau,\tau,q_t,\hat z_t)-u^*\right\|^2_M
-\right],
-\]
+$$\mathcal L_{\mathrm{action}} = \mathbb E\left[ \left\vert{}v_\theta(x_\tau,\tau,q_t,\hat z_t)-u^*\right\vert{}^2_M \right]$$
 
 where \(x_\tau\) is a sampled flow input, \(u^*\) is its target velocity, and
 \(M\) excludes padded action entries. The direct visual-language input to the
